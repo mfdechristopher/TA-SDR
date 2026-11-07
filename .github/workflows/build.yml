@@ -1,0 +1,28 @@
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: write
+jobs:
+  windows-exe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 autoconf automake libtool make
+      - name: DSP self-test (synthetic signals)
+        run: ./build.sh test
+      - name: Build TA-SDR.exe
+        run: ./build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TA-SDR.exe
+          path: TA-SDR.exe
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" TA-SDR.exe --title "TA-SDR ${{ github.ref_name }}" --generate-notes

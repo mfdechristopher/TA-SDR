@@ -1,0 +1,64 @@
+diff --git a/include/rtl-sdr.h b/include/rtl-sdr.h
+index d88e762..9c4cab4 100644
+--- a/include/rtl-sdr.h
++++ b/include/rtl-sdr.h
+@@ -159,6 +159,9 @@ RTLSDR_API int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq);
+  */
+ RTLSDR_API uint32_t rtlsdr_get_center_freq(rtlsdr_dev_t *dev);
+ 
++/*! Actual tuned centre minus requested centre, in Hz (R820T/R828D PLL quantisation). Custom addition. */
++RTLSDR_API int rtlsdr_get_tuner_freq_error(rtlsdr_dev_t *dev);
++
+ /*!
+  * Set the frequency correction value for the device.
+  *
+diff --git a/include/tuner_r82xx.h b/include/tuner_r82xx.h
+index 99d5682..9166912 100644
+--- a/include/tuner_r82xx.h
++++ b/include/tuner_r82xx.h
+@@ -80,6 +80,7 @@ struct r82xx_priv {
+ 	enum r82xx_xtal_cap_value	xtal_cap_sel;
+ 	uint16_t			pll;	/* kHz */
+ 	uint32_t			int_freq;
++	int32_t				pll_err;	/* actual LO minus requested LO, Hz */
+ 	uint32_t			rf_freq;
+ 	uint8_t				fil_cal_code;
+ 	uint8_t				input;
+diff --git a/src/librtlsdr.c b/src/librtlsdr.c
+index 82bab6d..c1f142c 100644
+--- a/src/librtlsdr.c
++++ b/src/librtlsdr.c
+@@ -928,6 +928,16 @@ int rtlsdr_set_center_freq(rtlsdr_dev_t *dev, uint32_t freq)
+ 	return r;
+ }
+ 
++/* Actual tuned centre minus requested centre (Hz), for tuners with coarse PLL steps */
++int rtlsdr_get_tuner_freq_error(rtlsdr_dev_t *dev)
++{
++	if (!dev || dev->direct_sampling)
++		return 0;
++	if (dev->tuner_type == RTLSDR_TUNER_R820T || dev->tuner_type == RTLSDR_TUNER_R828D)
++		return dev->r82xx_p.pll_err;
++	return 0;
++}
++
+ uint32_t rtlsdr_get_center_freq(rtlsdr_dev_t *dev)
+ {
+ 	if (!dev)
+diff --git a/src/tuner_r82xx.c b/src/tuner_r82xx.c
+index 979191d..7cdfe93 100644
+--- a/src/tuner_r82xx.c
++++ b/src/tuner_r82xx.c
+@@ -534,6 +534,12 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
+ 		n_sdm <<= 1;
+ 	}
+ 
++	/* record the LO frequency error caused by integer-kHz truncation and SDM resolution */
++	{
++		double vco_act = 2.0 * (double)pll_ref * ((double)nint + (double)sdm / 65536.0);
++		priv->pll_err = (int32_t)(vco_act / (double)mix_div - (double)freq + ((vco_act / (double)mix_div - (double)freq) < 0 ? -0.5 : 0.5));
++	}
++
+ 	rc = r82xx_write_reg(priv, 0x16, sdm >> 8);
+ 	if (rc < 0)
+ 		return rc;
