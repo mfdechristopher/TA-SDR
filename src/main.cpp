@@ -27,7 +27,7 @@ static const ModeInfo MODES[M_COUNT] = {
     { "WFM", 100000, 270000, 5000, 200000, 100000 } };
 
 struct Preset { const char* name; double f; int mode; };
-static const Preset PRESETS[] = {
+static const Preset DEFAULTS[] = {
     { "-- Presets (ham bands + more) --", 0, 0 },
     { "Ham 160 m  1.900 LSB", 1900000, M_LSB },   { "Ham 80 m  3.850 LSB", 3850000, M_LSB },
     { "Ham 80 m CW  3.550", 3550000, M_CW },      { "Ham 60 m  5.3585 USB", 5358500, M_USB },
@@ -49,7 +49,11 @@ static const Preset PRESETS[] = {
     { "NOAA weather  162.550", 162550000, M_NFM }, { "GMRS/FRS  462.5625", 462562500, M_NFM },
     { "ADS-B  1090 MHz (spectrum)", 1090000000, M_AM },
 };
-static const int NPRESETS = sizeof(PRESETS) / sizeof(PRESETS[0]);
+static const int NDEFAULTS = sizeof(DEFAULTS) / sizeof(DEFAULTS[0]);
+
+// user-editable preset list (index i here == Band combo item i+1)
+struct UPreset { std::string name; double f; int mode; double bw; };   // bw 0 = mode default
+static std::vector<UPreset> presets;
 
 struct Band { double lo, hi; const char* name; };
 static const Band BANDS[] = {
@@ -76,7 +80,7 @@ static const int NSTEPS = sizeof(STEPS) / sizeof(STEPS[0]);
 enum {
     IDC_MODE = 100, IDC_BW, IDC_STEP, IDC_BAND, IDC_VOL, IDC_SQ, IDC_TAGC, IDC_GAIN, IDC_RAGC, IDC_BIAS, IDC_NB,
     IDC_DEEMPH, IDC_STEREO, IDC_AGC, IDC_PITCH, IDC_DEV, IDC_START, IDC_RATE, IDC_PPM, IDC_HF, IDC_ZOOM,
-    IDC_REF, IDC_RNG, IDC_GO, IDC_GOBTN, IDC_RECA, IDC_RECI
+    IDC_REF, IDC_RNG, IDC_GO, IDC_GOBTN, IDC_RECA, IDC_RECI, IDC_PADD, IDC_PEDIT, IDC_PDEL, IDC_PRESET
 };
 #define WM_DEVEND (WM_APP + 1)
 #define SPEC_N 16384
@@ -596,6 +600,122 @@ static void drawTop(HDC hdc) {
     TextOutA(hdc, sr.left, sr.top, l1, (int)strlen(l1)); TextOutA(hdc, sr.left, sr.top + S(18), l2, (int)strlen(l2));
 }
 
+
+// ------------------------------------------------------------------ preset storage
+static std::string presetPath() { return appDir() + "\\ta-sdr-presets.txt"; }
+static void defaultPresets() {
+    presets.clear();
+    for (int i = 1; i < NDEFAULTS; i++) presets.push_back({ DEFAULTS[i].name, DEFAULTS[i].f, DEFAULTS[i].mode, 0 });
+}
+static void savePresets() {
+    FILE* f = fopen(presetPath().c_str(), "w"); if (!f) { setStatus("Could not write the presets file"); return; }
+    fprintf(f, "# TA-SDR presets: name|frequency Hz|mode (0 AM,1 SAM,2 USB,3 LSB,4 CW,5 NFM,6 WFM)|bandwidth Hz (0 = default)\n");
+    for (auto& p : presets) fprintf(f, "%s|%.0f|%d|%.0f\n", p.name.c_str(), p.f, p.mode, p.bw);
+    fclose(f);
+}
+static void loadPresets() {
+    FILE* f = fopen(presetPath().c_str(), "r"); if (!f) { defaultPresets(); return; }
+    presets.clear(); char line[600];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        std::string t = line; while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+        std::vector<std::string> parts; size_t a = 0, b;
+        while ((b = t.find('|', a)) != std::string::npos) { parts.push_back(t.substr(a, b - a)); a = b + 1; }
+        parts.push_back(t.substr(a));
+        if (parts.size() < 3) continue;
+        UPreset p; p.name = parts[0]; p.f = atof(parts[1].c_str()); p.mode = atoi(parts[2].c_str()); p.bw = parts.size() > 3 ? atof(parts[3].c_str()) : 0;
+        if (p.name.empty() || p.f < 1000 || p.f > 2200e6 || p.mode < 0 || p.mode >= M_COUNT) continue;
+        presets.push_back(p);
+    }
+    fclose(f);
+}
+static void refillBand(int sel) {
+    SendMessage(g.cBand, CB_RESETCONTENT, 0, 0);
+    char h[64]; snprintf(h, sizeof h, "-- Presets (%d) --", (int)presets.size());
+    SendMessageA(g.cBand, CB_ADDSTRING, 0, (LPARAM)h);
+    for (auto& p : presets) SendMessageA(g.cBand, CB_ADDSTRING, 0, (LPARAM)p.name.c_str());
+    SendMessage(g.cBand, CB_SETCURSEL, sel, 0);
+}
+
+// ------------------------------------------------------------------ preset editor dialog (modal, built in code)
+struct PDlg { UPreset p; bool ok = false, done = false; HWND hName, hFreq, hMode, hBw; };
+static HWND mkp(HWND par, const char* cls, const char* text, DWORD style, int id, int x, int y, int w, int h) {
+    HWND c = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h), par, (HMENU)(INT_PTR)id, hInst, 0);
+    SendMessage(c, WM_SETFONT, (WPARAM)g.font, TRUE); return c;
+}
+static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    PDlg* d = (PDlg*)GetWindowLongPtr(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_CREATE: {
+        d = (PDlg*)((CREATESTRUCT*)l)->lpCreateParams; SetWindowLongPtr(h, GWLP_USERDATA, (LONG_PTR)d);
+        mkp(h, "STATIC", "Name", SS_LEFT, -1, 12, 15, 90, 16);
+        d->hName = mkp(h, "EDIT", d->p.name.c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 200, 110, 12, 248, 22);
+        mkp(h, "STATIC", "Frequency", SS_LEFT, -1, 12, 47, 90, 16);
+        char fb[64]; snprintf(fb, sizeof fb, "%.6f", d->p.f / 1e6); { char* e = fb + strlen(fb); while (e > fb && e[-1] == '0') *--e = 0; if (e > fb && e[-1] == '.') *--e = 0; }
+        d->hFreq = mkp(h, "EDIT", fb, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 201, 110, 44, 110, 22);
+        mkp(h, "STATIC", "MHz, or 14200k", SS_LEFT, -1, 228, 47, 140, 16);
+        mkp(h, "STATIC", "Mode", SS_LEFT, -1, 12, 79, 90, 16);
+        d->hMode = mkp(h, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 202, 110, 76, 90, 200);
+        for (int i = 0; i < M_COUNT; i++) SendMessageA(d->hMode, CB_ADDSTRING, 0, (LPARAM)MODES[i].name);
+        SendMessage(d->hMode, CB_SETCURSEL, d->p.mode, 0);
+        mkp(h, "STATIC", "Bandwidth", SS_LEFT, -1, 12, 111, 90, 16);
+        char bb[32]; if (d->p.bw > 0) snprintf(bb, sizeof bb, "%g", d->p.bw / 1000); else bb[0] = 0;
+        d->hBw = mkp(h, "EDIT", bb, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 203, 110, 108, 60, 22);
+        mkp(h, "STATIC", "kHz  (blank = mode default)", SS_LEFT, -1, 178, 111, 190, 16);
+        mkp(h, "BUTTON", "OK", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 192, 146, 80, 26);
+        mkp(h, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 280, 146, 80, 26);
+        return 0; }
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) {
+            char nm[256], fq[64], bw[32]; GetWindowTextA(d->hName, nm, 256); GetWindowTextA(d->hFreq, fq, 64); GetWindowTextA(d->hBw, bw, 32);
+            std::string name = nm; for (auto& c : name) if (c == '|' || c == '\n' || c == '\r') c = ' ';
+            while (!name.empty() && name.back() == ' ') name.pop_back(); while (!name.empty() && name[0] == ' ') name.erase(0, 1);
+            double f; if (name.empty()) { MessageBoxA(h, "Please give the preset a name.", "TA-SDR", MB_OK | MB_ICONINFORMATION); return 0; }
+            if (!parseFreq(fq, f)) { MessageBoxA(h, "I couldn't understand that frequency.\nTry 7.1 (MHz), 14200 (kHz), 146.52M.", "TA-SDR", MB_OK | MB_ICONINFORMATION); return 0; }
+            int mode = (int)SendMessage(d->hMode, CB_GETCURSEL, 0, 0); if (mode < 0) mode = 0;
+            double b = atof(bw) * 1000; if (b > 0) b = std::max(MODES[mode].bwMin, std::min(MODES[mode].bwMax, b)); else b = 0;
+            d->p = { name, f, mode, b }; d->ok = true; d->done = true; return 0;
+        }
+        if (LOWORD(w) == IDCANCEL) { d->done = true; return 0; }
+        break;
+    case WM_CLOSE: d->done = true; return 0;
+    }
+    return DefWindowProc(h, m, w, l);
+}
+static bool presetDialog(const char* title, UPreset& p) {
+    static bool reg = false;
+    if (!reg) { WNDCLASSA wc = {}; wc.lpfnWndProc = DlgProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(0, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.lpszClassName = "TaSdrDlg"; wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(1)); RegisterClassA(&wc); reg = true; }
+    PDlg d; d.p = p;
+    RECT pr; GetWindowRect(g.hwnd, &pr); int W = S(380), H = S(220);
+    HWND dlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "TaSdrDlg", title, WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        pr.left + (pr.right - pr.left - W) / 2, pr.top + S(120), W, H, g.hwnd, 0, hInst, &d);
+    EnableWindow(g.hwnd, FALSE); SetFocus(d.hName); SendMessage(d.hName, EM_SETSEL, 0, -1);
+    MSG m;
+    while (!d.done && GetMessage(&m, 0, 0, 0) > 0) { if (!IsDialogMessage(dlg, &m)) { TranslateMessage(&m); DispatchMessage(&m); } }
+    EnableWindow(g.hwnd, TRUE); DestroyWindow(dlg); SetForegroundWindow(g.hwnd);
+    if (d.ok) p = d.p; return d.ok;
+}
+static void presetCmd(int id) {
+    int sel = ComboBox_GetCurSel(g.cBand);
+    if (id == IDC_PADD) {
+        UPreset p; char nm[128]; const char* bn = bandName(g.freq);
+        snprintf(nm, sizeof nm, "%s%s%s %s", bn, bn[0] ? " " : "", fmtFreq(g.freq).c_str(), MODES[g.mode].name); p.name = nm; p.f = g.freq; p.mode = g.mode; p.bw = g.bw[g.mode];
+        if (presetDialog("Add preset", p)) { presets.push_back(p); savePresets(); refillBand((int)presets.size()); setStatus("Preset added: " + p.name); }
+    } else if (id == IDC_PEDIT) {
+        if (sel <= 0) { setStatus("Pick a preset in the Band list first, then press Edit"); return; }
+        UPreset p = presets[sel - 1];
+        if (presetDialog("Edit preset", p)) { presets[sel - 1] = p; savePresets(); refillBand(sel); setStatus("Preset updated: " + p.name); }
+    } else if (id == IDC_PDEL) {
+        if (sel <= 0) { setStatus("Pick a preset in the Band list first, then press Delete"); return; }
+        std::string q = "Delete preset \"" + presets[sel - 1].name + "\"?";
+        if (MessageBoxA(g.hwnd, q.c_str(), "TA-SDR", MB_YESNO | MB_ICONQUESTION) == IDYES) { presets.erase(presets.begin() + sel - 1); savePresets(); refillBand(0); setStatus("Preset deleted"); }
+    } else if (id == IDC_PRESET) {
+        if (MessageBoxA(g.hwnd, "Replace ALL presets with the built-in defaults?\nYour own presets will be lost.", "TA-SDR", MB_YESNO | MB_ICONWARNING) == IDYES) {
+            defaultPresets(); DeleteFileA(presetPath().c_str()); refillBand(0); setStatus("Presets reset to defaults"); }
+    }
+}
+
 // ------------------------------------------------------------------ settings
 static std::string iniPath() { return appDir() + "\\ta-sdr.ini"; }
 static void saveSettings() {
@@ -649,8 +769,7 @@ static void createControls() {
       SendMessage(c, CB_SETCURSEL, g.stepIdx, 0); g.cStep = c; }
     lbl("Band", 478, y1, 32);
     { HWND c = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_BAND, 512, y1, 188, 400);
-      for (int i = 0; i < NPRESETS; i++) SendMessageA(c, CB_ADDSTRING, 0, (LPARAM)PRESETS[i].name);
-      SendMessage(c, CB_SETCURSEL, 0, 0); g.cBand = c; }
+      g.cBand = c; refillBand(0); }
     lbl("Vol", 710, y1, 24); g.cVol = track(IDC_VOL, 736, y1, 96, 0, 100, g.volume);
     lbl("Squelch", 842, y1, 50); g.cSq = track(IDC_SQ, 894, y1, 96, 0, 100, g.squelch); g.cSqLbl = lbl("", 992, y1, 50);
 
@@ -680,7 +799,10 @@ static void createControls() {
     lbl("(7.1 = MHz,  14200 = kHz,  1000k,  146.52M)", 212, y4, 250);
     g.cRecA = mk("BUTTON", "Rec Audio", BS_PUSHBUTTON | WS_TABSTOP, IDC_RECA, 470, y4, 84, 24);
     g.cRecI = mk("BUTTON", "Rec IQ", BS_PUSHBUTTON | WS_TABSTOP, IDC_RECI, 560, y4, 70, 24);
-    lbl("Tip: mouse wheel over a digit, or on the spectrum, tunes.  Click spectrum to tune.", 642, y4, 520);
+    mk("BUTTON", "+ Preset", BS_PUSHBUTTON | WS_TABSTOP, IDC_PADD, 650, y4, 70, 24);
+    mk("BUTTON", "Edit", BS_PUSHBUTTON | WS_TABSTOP, IDC_PEDIT, 724, y4, 54, 24);
+    mk("BUTTON", "Delete", BS_PUSHBUTTON | WS_TABSTOP, IDC_PDEL, 782, y4, 60, 24);
+    mk("BUTTON", "Reset list", BS_PUSHBUTTON | WS_TABSTOP, IDC_PRESET, 846, y4, 74, 24);
 
     int nd = (int)rtlsdr_get_device_count();
     for (int i = 0; i < nd; i++) { char b[300]; const char* nm = rtlsdr_get_device_name(i); snprintf(b, sizeof b, "#%d  %s", i, nm ? nm : "RTL-SDR"); SendMessageA(g.cDev, CB_ADDSTRING, 0, (LPARAM)b); }
@@ -695,9 +817,11 @@ static void createControls() {
 
 // ------------------------------------------------------------------ events
 static void doPreset(int idx) {
-    if (idx <= 0 || idx >= NPRESETS) return;
-    const Preset& p = PRESETS[idx];
-    g.mode = p.mode; ComboBox_SetCurSel(g.cMode, g.mode); setBwTrack();
+    if (idx <= 0 || idx > (int)presets.size()) return;
+    const UPreset& p = presets[idx - 1];
+    g.mode = p.mode; ComboBox_SetCurSel(g.cMode, g.mode);
+    if (p.bw > 0) g.bw[p.mode] = std::max(MODES[p.mode].bwMin, std::min(MODES[p.mode].bwMax, p.bw));
+    setBwTrack();
     g.stepIdx = 5; double want = MODES[p.mode].stepDef; for (int i = 0; i < NSTEPS; i++) if (STEPS[i] == want) g.stepIdx = i;
     ComboBox_SetCurSel(g.cStep, g.stepIdx);
     if (p.mode == M_WFM || p.mode == M_NFM) { g.deemph = true; Button_SetCheck(g.cDeemph, BST_CHECKED); }
@@ -723,6 +847,7 @@ static void onCommand(int id, int code) {
     case IDC_ZOOM: if (code == CBN_SELCHANGE) { g.zoomIdx = ComboBox_GetCurSel(g.cZoom); g.viewCenter = g.freq; ensureView(); InvalidateRect(g.hwnd, 0, FALSE); } break;
     case IDC_PPM: if (code == EN_CHANGE) { char b[32]; GetWindowTextA(g.cPpm, b, 32); g.ppm = atoi(b); if (g.dev && !g.demo) { rtlsdr_set_freq_correction(g.dev, g.ppm); g.hwErr = rtlsdr_get_tuner_freq_error(g.dev); applyRx(); } } break;
     case IDC_GOBTN: { char b[64]; GetWindowTextA(g.cGo, b, 64); double f; if (parseFreq(b, f)) { setFreq(f); SetFocus(g.hwnd); } else setStatus("Could not understand that frequency"); } break;
+    case IDC_PADD: case IDC_PEDIT: case IDC_PDEL: case IDC_PRESET: presetCmd(id); break;
     case IDC_START: if (g.running) stopRadio(); else startRadio(); break;
     case IDC_RECA:
         if (g.recA) { stopRecordings(); setStatus("Audio recording saved"); break; }
@@ -828,7 +953,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
     HDC sdc = GetDC(0); g.dpi = GetDeviceCaps(sdc, LOGPIXELSX); ReleaseDC(0, sdc);
     InitializeCriticalSection(&g.rxCs);
     for (int m = 0; m < M_COUNT; m++) g.bw[m] = MODES[m].bwDef;
-    loadSettings(); makePalette();
+    loadSettings(); loadPresets(); makePalette();
     g.font = CreateFontA(-S(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     g.fontSm = CreateFontA(-S(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Segoe UI");
     g.fontBig = CreateFontA(-S(44), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH, "Consolas");
@@ -837,6 +962,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
     wc.hbrBackground = 0; wc.lpszClassName = "TaSdrWnd"; wc.hIcon = LoadIcon(hi, MAKEINTRESOURCE(1)); RegisterClassA(&wc);
     HWND w = CreateWindowExA(0, "TaSdrWnd", "TA-SDR  -  AM / SAM / SSB / CW / NFM / WFM", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, S(1180), S(760), 0, 0, hi, 0);
+    SendMessage(w, WM_SETICON, ICON_BIG, (LPARAM)LoadImage(hi, MAKEINTRESOURCE(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
+    SendMessage(w, WM_SETICON, ICON_SMALL, (LPARAM)LoadImage(hi, MAKEINTRESOURCE(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
     createControls(); updateLabels(); setMode(g.mode);
     ComboBox_SetCurSel(g.cStep, g.stepIdx);
     layoutPlot();

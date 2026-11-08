@@ -4,3 +4,4 @@ build-test
 *.o
 recordings/
 ta-sdr.ini
+ta-sdr-presets.txt
