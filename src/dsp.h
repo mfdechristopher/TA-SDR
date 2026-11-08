@@ -245,14 +245,35 @@ public:
     }
     void setRateAdjust(double a) { if (built) { rsA.setAdjust(a); rsB.setAdjust(a); } }
 
-    // Process raw unsigned 8-bit IQ. Audio frames (interleaved stereo) appended to out.
+    // Ingest raw unsigned 8-bit IQ (RTL-SDR). Audio frames (interleaved stereo) appended to out.
     size_t process(const uint8_t* raw, size_t nbytes, std::vector<float>& out) {
         if (!built) return 0;
-        size_t n = nbytes / 2;
-        if (bufI.size() < n) { bufI.resize(n); bufQ.resize(n); mixI.resize(n); mixQ.resize(n); }
+        size_t n = nbytes / 2; ensure(n);
+        for (size_t k = 0; k < n; k++) { bufI[k] = lut[raw[2 * k]]; bufQ[k] = lut[raw[2 * k + 1]]; }
+        return core(n, out);
+    }
+    // Signed 8-bit IQ (HackRF)
+    size_t processI8(const int8_t* raw, size_t nbytes, std::vector<float>& out) {
+        if (!built) return 0;
+        size_t n = nbytes / 2; ensure(n);
+        const float sc = 1.0f / 128.0f;
+        for (size_t k = 0; k < n; k++) { bufI[k] = raw[2 * k] * sc; bufQ[k] = raw[2 * k + 1] * sc; }
+        return core(n, out);
+    }
+    // Interleaved float32 IQ (Airspy, Airspy HF+), nsamples = complex samples
+    size_t processF(const float* iq, size_t nsamples, std::vector<float>& out) {
+        if (!built) return 0;
+        size_t n = nsamples; ensure(n);
+        for (size_t k = 0; k < n; k++) { bufI[k] = iq[2 * k]; bufQ[k] = iq[2 * k + 1]; }
+        return core(n, out);
+    }
+
+private:
+    void ensure(size_t n) { if (bufI.size() < n) { bufI.resize(n); bufQ.resize(n); mixI.resize(n); mixQ.resize(n); } }
+    size_t core(size_t n, std::vector<float>& out) {
         const float a = 5e-5f;
         for (size_t k = 0; k < n; k++) {
-            float i = lut[raw[2 * k]], q = lut[raw[2 * k + 1]];
+            float i = bufI[k], q = bufQ[k];
             dcI += a * (i - dcI); dcQ += a * (q - dcQ);
             i -= dcI; q -= dcQ;
             if (cfg.invert) q = -q;
@@ -326,6 +347,7 @@ public:
         return no;
     }
 
+public:
     void snapshot(float* iq, int nsamp) {
         if (nsamp > RING) nsamp = RING;
         int start = (wpos - nsamp) & (RING - 1);

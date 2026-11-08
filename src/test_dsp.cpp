@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <complex>
+#include <chrono>
 using namespace dsp;
 
 static const double FS = 2048000.0;
@@ -119,6 +120,44 @@ int main() {
         check("stereo pilot lock", rx.stereoLock, "");
         check("L has 1 kHz, R has 2.5 kHz", l1 > -12 && r2 > -12, "(L1k %.1f dB, R2.5k %.1f dB)", l1, r2);
         check("channel separation > 25 dB", (l1 - r1) > 25 && (r2 - l2) > 25, "(L:%.1f R:%.1f dB)", l1 - r1, r2 - l2);
+    }
+
+    // ---- other sample formats and high sample rates (HackRF / Airspy / Airspy HF+)
+    {
+        printf("Sample formats / high rates\n");
+        struct Case { const char* name; double fs; int fmt; int mode; double secs; } cases[] = {
+            { "float32 @ 768 ksps (Airspy HF+)", 768000, 2, M_AM, 2.0 },
+            { "float32 @ 10 Msps (Airspy R2)", 10e6, 2, M_AM, 1.2 },
+            { "int8    @ 8 Msps (HackRF)", 8e6, 1, M_USB, 1.2 },
+            { "int8    @ 20 Msps (HackRF max)", 20e6, 1, M_NFM, 0.8 } };
+        for (auto& cs : cases) {
+            size_t n = (size_t)(cs.fs * cs.secs); double fo = cs.fs * 0.2, ph = 0;
+            std::vector<float> f32; std::vector<int8_t> i8; if (cs.fmt == 2) f32.resize(n * 2); else i8.resize(n * 2);
+            double w = 2 * PI * fo / cs.fs, wt = 2 * PI * 1000 / cs.fs, ta = 0, tp = 0;
+            for (size_t k = 0; k < n; k++) {
+                double env = 1, fm = 0;
+                if (cs.mode == M_AM) env = 1 + 0.6 * sin(ta); ta += wt;
+                if (cs.mode == M_NFM) { fm = 3000 * sin(tp) * 2 * PI / cs.fs; tp += wt; }
+                double fr = fo + (cs.mode == M_USB ? 1500 : 0);
+                ph += (cs.mode == M_USB ? 2 * PI * fr / cs.fs : w) + fm;
+                double i = 0.08 * env * cos(ph) + 0.004 * frand(), q = 0.08 * env * sin(ph) + 0.004 * frand();
+                if (cs.fmt == 2) { f32[2 * k] = (float)i; f32[2 * k + 1] = (float)q; }
+                else { i8[2 * k] = (int8_t)lround(i * 127); i8[2 * k + 1] = (int8_t)lround(q * 127); }
+            }
+            Receiver rx; RxConfig c; c.fs = cs.fs; c.mode = cs.mode; c.bw = cs.mode == M_AM ? 8000 : cs.mode == M_NFM ? 12500 : 2800; c.shiftHz = fo; rx.configure(c);
+            std::vector<float> au; const size_t blk = 32768; double busy = 0;
+            for (size_t off = 0; off + blk <= n; off += blk) {
+                auto t0 = std::chrono::steady_clock::now();
+                if (cs.fmt == 2) rx.processF(&f32[2 * off], blk, au); else rx.processI8(&i8[2 * off], blk * 2, au);
+                busy += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+            size_t nf = au.size() / 2, nn = 32768, st = nf - nn - 100;
+            double pk = peakHz(au, 0, st, nn, 300, 3000);
+            double want = cs.mode == M_USB ? 1500 : 1000;
+            double load = busy / (cs.secs * ((double)(n / blk * blk) / n));
+            char info[160]; snprintf(info, sizeof info, "(tone %.0f Hz, CPU load %.0f%% of one core)", pk, load * 100);
+            printf("  [%s] %s %s\n", fabs(pk - want) < 15 ? "PASS" : "FAIL", cs.name, info); if (fabs(pk - want) >= 15) fails++;
+        }
     }
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASSED\n", fails);
     return fails != 0;

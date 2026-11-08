@@ -13,8 +13,8 @@
 #include <vector>
 #include <string>
 #include <complex>
-#include <rtl-sdr.h>
 #include "dsp.h"
+#include "demo.h"
 
 using namespace dsp;
 
@@ -71,8 +71,6 @@ static const char* bandName(double f) {
     return "";
 }
 
-static const double RATES[] = { 250000, 1024000, 1400000, 1800000, 1920000, 2048000, 2400000, 2560000, 2800000, 3200000 };
-static const int NRATES = sizeof(RATES) / sizeof(RATES[0]);
 static const double STEPS[] = { 1, 10, 50, 100, 500, 1000, 2500, 5000, 6250, 8333, 9000, 10000, 12500, 25000, 100000, 200000, 1000000 };
 static const int NSTEPS = sizeof(STEPS) / sizeof(STEPS[0]);
 
@@ -157,8 +155,8 @@ struct G {
     bool tunerAgc = false, rtlAgc = false, bias = false, nb = false, deemph = true, stereo = true;
     double refDb = -10, rngDb = 90, viewCenter = 7100000;
     // device
-    rtlsdr_dev_t* dev = nullptr; HANDLE devThread = 0; bool running = false, demo = false; volatile LONG stop = 0;
-    std::vector<int> gains; int tunerType = 0; double maxCenter = 1766e6; std::string devName; std::string status;
+    Device* dev = nullptr; bool running = false; volatile LONG stop = 0; std::vector<DevEntry> entries; std::vector<double> rates;
+    double minF = 1000, maxF = 2200e6, wantFreq = 7100000; std::string devName, status, lastDev;
     // dsp
     Receiver rx; CRITICAL_SECTION rxCs; AudioOut audio; std::vector<float> audTmp;
     Spectrum spec; std::vector<float> snap, dbNew, dbAvg, colDb;
@@ -177,11 +175,12 @@ static HINSTANCE hInst;
 // forward declarations
 static void applyRx();
 static void retuneHardware();
-static void setFreq(double f);
+static void setFreq(double f, bool remember = true);
 static void setMode(int m, bool keepBw = true);
 static void startRadio();
 static void stopRadio();
 static void updateLabels();
+static void adaptUiToDevice();
 
 // ------------------------------------------------------------------ small helpers
 static void setStatus(const std::string& s) { g.status = s; if (g.hwnd) InvalidateRect(g.hwnd, &g.rcStatus, FALSE); }
@@ -208,16 +207,17 @@ static void wavHeader(FILE* f, unsigned frames) {
 }
 static std::string recDir() { std::string d = appDir() + "\\recordings"; CreateDirectoryA(d.c_str(), 0); return d; }
 
-// ------------------------------------------------------------------ IQ callback (device thread or demo thread)
-static void iqCallback(unsigned char* buf, uint32_t len, void*) {
+// ------------------------------------------------------------------ sample sink (called on the device's own thread)
+static void sampleSink(const void* data, size_t count, int fmt) {
     if (g.stop) return;
-    double adj = 0;
     double fill = (double)g.audio.fill(), target = 4096;
-    double e = (fill - target) / target; if (e > 1) e = 1; else if (e < -1) e = -1; adj = 0.002 * e;
+    double e = (fill - target) / target; if (e > 1) e = 1; else if (e < -1) e = -1;
     EnterCriticalSection(&g.rxCs);
     g.audTmp.clear();
-    g.rx.setRateAdjust(adj);
-    g.rx.process(buf, len, g.audTmp);
+    g.rx.setRateAdjust(0.002 * e);
+    if (fmt == FMT_U8) g.rx.process((const uint8_t*)data, count * 2, g.audTmp);
+    else if (fmt == FMT_I8) g.rx.processI8((const int8_t*)data, count * 2, g.audTmp);
+    else g.rx.processF((const float*)data, count, g.audTmp);
     LeaveCriticalSection(&g.rxCs);
     size_t frames = g.audTmp.size() / 2;
     if (frames) {
@@ -228,95 +228,10 @@ static void iqCallback(unsigned char* buf, uint32_t len, void*) {
             fwrite(t.data(), 2, t.size(), g.recA); g.recAFrames += (unsigned)frames;
         }
     }
-    if (g.recI) fwrite(buf, 1, len, g.recI);
-}
-
-static DWORD WINAPI DevThread(LPVOID) {
-    rtlsdr_read_async(g.dev, iqCallback, 0, 0, 65536);
-    if (!g.stop) PostMessage(g.hwnd, WM_DEVEND, 0, 0);
-    return 0;
-}
-
-// ------------------------------------------------------------------ demo signal source (no hardware needed)
-struct DemoSrc { int type; double f, amp; };
-static const DemoSrc DEMO[] = {
-    { 0, 1000000, 0.20 },  { 0, 10000000, 0.20 }, { 5, 7030000, 0.15 }, { 6, 7150000, 0.15 }, { 7, 14250000, 0.15 },
-    { 0, 27185000, 0.20 }, { 4, 98100000, 0.20 },  { 3, 146520000, 0.20 }, { 0, 121500000, 0.20 }, { 3, 162550000, 0.15 } };
-static const char* MORSE_MSG = "CQ CQ DE W1AW K";
-static const char* morse(char c) {
-    switch (c) { case 'C': return "-.-."; case 'Q': return "--.-"; case 'D': return "-.."; case 'E': return "."; case 'W': return ".--";
-    case '1': return ".----"; case 'A': return ".-"; case 'K': return "-.-"; default: return ""; }
-}
-static bool morseKey(double t) {
-    const double dit = 1.2 / 16;
-    static std::string seq; // 1 = key down, 0 = up, one char per dit
-    if (seq.empty()) {
-        for (const char* p = MORSE_MSG; *p; p++) {
-            if (*p == ' ') { seq += "0000"; continue; }
-            for (const char* m = morse(*p); *m; m++) { seq += (*m == '.') ? "1" : "111"; seq += "0"; }
-            seq += "00";
-        }
-        seq += "000000";
-    }
-    size_t i = (size_t)(t / dit) % seq.size(); return seq[i] == '1';
-}
-static DWORD WINAPI DemoThread(LPVOID) {
-    const size_t BLK = 32768, CH = 4;
-    std::vector<float> ai(BLK), aq(BLK); std::vector<uint8_t> raw(BLK * 2);
-    LARGE_INTEGER fq, t0, now; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0);
-    double tsamp = 0; uint32_t rng = 7;
-    static double ph[16]; for (int i = 0; i < 16; i++) ph[i] = 0;
-    while (!g.stop) {
-        double fs = g.fs, c = g.hwCenter;
-        std::fill(ai.begin(), ai.end(), 0.f); std::fill(aq.begin(), aq.end(), 0.f);
-        for (size_t s = 0; s < sizeof(DEMO) / sizeof(DEMO[0]); s++) {
-            const DemoSrc& d = DEMO[s];
-            double span = fs * 0.48;
-            double fmax = (d.type == 4) ? 120e3 : (d.type == 3 ? 15e3 : 4e3);
-            double off = d.f - c; if (fabs(off) + fmax > span + 1) continue;
-            for (size_t k = 0; k < BLK; k += CH) {
-                double t = tsamp + k / fs, amp = d.amp, df = off;
-                switch (d.type) {
-                case 0: { double env = 0.5 + 0.5 * sin(2 * PI * 0.4 * t); amp *= 1 + 0.5 * (0.6 * sin(2 * PI * 440 * t) + 0.4 * env * sin(2 * PI * 1250 * t)); } break;
-                case 5: amp *= morseKey(t) ? 1.0 : 0.0; break;
-                case 6: { double sy = sin(2 * PI * 2.7 * t) > 0 ? 1.0 : 0.25; amp *= sy * (0.7 + 0.3 * sin(2 * PI * 700 * t)); df -= 900 + 300 * sin(2 * PI * 0.7 * t); } break; // LSB voice-ish
-                case 7: { double sy = sin(2 * PI * 3.1 * t) > 0 ? 1.0 : 0.25; amp *= sy; df += 1100 + 500 * sin(2 * PI * 0.9 * t); } break;   // USB
-                case 3: { double gate = fmod(t, 3.0) < 2.0 ? 1.0 : 0.0; amp *= gate; df += 3000 * sin(2 * PI * (900 + 300 * sin(2 * PI * 0.8 * t)) * t); } break;
-                case 4: {
-                    double L = 0.7 * sin(2 * PI * 440 * t) * (fmod(t, 2.0) < 1.0 ? 1 : 0.15), R = 0.7 * sin(2 * PI * 660 * t) * (fmod(t, 2.0) < 1.0 ? 0.15 : 1);
-                    double comp = 0.45 * (L + R) + 0.45 * (L - R) * sin(2 * PI * 38000 * t) + 0.09 * sin(2 * PI * 19000 * t);
-                    df += 75000 * comp;
-                } break;
-                }
-                double w = 2 * PI * df / fs, cs = cos(ph[s]), sn = sin(ph[s]), wc = cos(w), ws = sin(w);
-                for (size_t j = 0; j < CH; j++) {
-                    ai[k + j] += (float)(amp * cs); aq[k + j] += (float)(amp * sn);
-                    double nc = cs * wc - sn * ws, ns = cs * ws + sn * wc; cs = nc; sn = ns;
-                }
-                ph[s] = fmod(ph[s] + w * CH, 2 * PI);
-            }
-        }
-        tsamp += BLK / fs;
-        for (size_t k = 0; k < BLK; k++) {
-            rng = rng * 1664525u + 1013904223u; float n1 = ((rng >> 8) & 0xFFFF) / 32768.f - 1.f;
-            rng = rng * 1664525u + 1013904223u; float n2 = ((rng >> 8) & 0xFFFF) / 32768.f - 1.f;
-            float i = ai[k] + 0.02f * n1, q = aq[k] + 0.02f * n2;
-            i = std::max(-1.f, std::min(1.f, i)); q = std::max(-1.f, std::min(1.f, q));
-            raw[2 * k] = (uint8_t)(i * 127.5f + 127.5f); raw[2 * k + 1] = (uint8_t)(q * 127.5f + 127.5f);
-        }
-        iqCallback(raw.data(), (uint32_t)raw.size(), 0);
-        // pace to real time
-        double due = tsamp;
-        for (;;) { QueryPerformanceCounter(&now); double el = (double)(now.QuadPart - t0.QuadPart) / fq.QuadPart; if (el >= due || g.stop) break; Sleep(1); }
-    }
-    return 0;
+    if (g.recI) fwrite(data, fmt == FMT_F32 ? 8 : 2, count, g.recI);
 }
 
 // ------------------------------------------------------------------ radio control
-static double hwMaxFor(int tuner) {
-    switch (tuner) { case RTLSDR_TUNER_E4000: return 2200e6; case RTLSDR_TUNER_FC0012: return 948e6; case RTLSDR_TUNER_FC0013: return 1100e6;
-    case RTLSDR_TUNER_FC2580: return 924e6; default: return 1766e6; }
-}
 static void applyRx() {
     RxConfig c;
     c.fs = g.fs; c.mode = g.mode; c.bw = g.bw[g.mode]; c.cwPitch = g.pitch; c.shiftHz = g.freq - (g.hwCenter + g.hwErr);
@@ -324,18 +239,19 @@ static void applyRx() {
     c.squelchDb = g.squelch == 0 ? -200 : -100 + g.squelch * 0.9; c.volume = g.volume / 100.0;
     EnterCriticalSection(&g.rxCs); g.rx.configure(c); LeaveCriticalSection(&g.rxCs);
 }
+// keep the signal off the dongle's DC spike: centre the hardware a quarter of the span away
+static double pickCenter(double f) {
+    double c = f + g.fs / 4;
+    if (g.dev && !g.dev->validCenter(c)) { c = f - g.fs / 4; if (!g.dev->validCenter(c)) c = f; }
+    return floor(c + 0.5);
+}
 static void retuneHardware() {
-    double c = g.freq + g.fs / 4;
-    if (c > g.maxCenter) c = g.freq - g.fs / 4;
-    if (c < 0) c = g.freq;
-    g.hwCenter = floor(c + 0.5); g.hwErr = 0;
-    if (g.dev && !g.demo) {
-        int r = rtlsdr_set_center_freq(g.dev, (uint32_t)g.hwCenter);
-        if (r < 0) setStatus("Tuner could not tune to that frequency");
-        g.hwErr = rtlsdr_get_tuner_freq_error(g.dev);
+    g.hwCenter = pickCenter(g.freq); g.hwErr = 0;
+    if (g.dev) {
+        if (!g.dev->setCenter(g.hwCenter)) setStatus("The receiver could not tune to that frequency");
+        g.hwErr = g.dev->centerError();
     }
-    g.hwValid = true;
-    g.viewCenter = g.freq;
+    g.hwValid = true; g.viewCenter = g.freq;
 }
 static void ensureView() {
     g.viewSpan = g.fs / (1 << g.zoomIdx);
@@ -344,8 +260,9 @@ static void ensureView() {
     g.viewCenter = std::max(lo, std::min(hi, g.viewCenter));
     g.viewLo = g.viewCenter - g.viewSpan / 2;
 }
-static void setFreq(double f) {
-    f = std::max(1000.0, std::min(f, 2200e6)); g.freq = f;
+static void setFreq(double f, bool remember) {
+    if (remember) g.wantFreq = f;                 // what the user asked for, even if this receiver can't reach it
+    f = std::max(g.minF, std::min(f, g.maxF)); g.freq = f;
     if (!g.hwValid || fabs(f - (g.hwCenter + g.hwErr)) > 0.43 * g.fs) { retuneHardware(); }
     applyRx(); ensureView(); updateLabels();
     InvalidateRect(g.hwnd, &g.rcFreq, FALSE); InvalidateRect(g.hwnd, &g.rcStatus, FALSE);
@@ -365,70 +282,90 @@ static void updateLabels() {
     snprintf(b, sizeof b, "%.1f kHz", g.bw[g.mode] / 1000.0); SetWindowTextA(g.cBwLbl, b);
     if (g.squelch == 0) strcpy(b, "Off"); else snprintf(b, sizeof b, "%.0f dB", -100 + g.squelch * 0.9);
     SetWindowTextA(g.cSqLbl, b);
-    if (!g.gains.empty()) { int gi = std::max(0, std::min((int)g.gains.size() - 1, g.gainIdx)); snprintf(b, sizeof b, "%.1f dB", g.gains[gi] / 10.0); }
-    else strcpy(b, "-");
-    SetWindowTextA(g.cGainLbl, b);
+    SetWindowTextA(g.cGainLbl, g.dev && g.dev->gainSteps() ? g.dev->gainText(g.gainIdx).c_str() : "-");
     snprintf(b, sizeof b, "%.0f Hz", g.pitch); SetWindowTextA(g.cPitchLbl, b);
 }
 static void applyGain() {
-    if (!g.dev || g.demo) return;
-    if (g.tunerAgc) rtlsdr_set_tuner_gain_mode(g.dev, 0);
-    else if (!g.gains.empty()) {
-        rtlsdr_set_tuner_gain_mode(g.dev, 1);
-        rtlsdr_set_tuner_gain(g.dev, g.gains[std::max(0, std::min((int)g.gains.size() - 1, g.gainIdx))]);
-    }
-    rtlsdr_set_agc_mode(g.dev, g.rtlAgc ? 1 : 0);
+    if (!g.dev) return;
+    if (g.dev->hasAgc() && g.tunerAgc) g.dev->setAgc(true);
+    else { if (g.dev->hasAgc()) g.dev->setAgc(false); if (g.dev->gainSteps()) g.dev->setGain(g.gainIdx); }
+    if (g.dev->extraName()) g.dev->setExtra(g.rtlAgc);
 }
 static void applySampleRate() {
-    if (g.dev && !g.demo) { rtlsdr_set_sample_rate(g.dev, (uint32_t)g.fs); rtlsdr_set_tuner_bandwidth(g.dev, 0); }
+    if (g.dev) g.dev->setRate(g.fs);
     g.hwValid = false; applyRx(); setFreq(g.freq);
 }
 
-static void startRadio() {
+// --- device list / selection
+static void fillRates() {
+    g.rates = g.dev->rates(); SendMessage(g.cRate, CB_RESETCONTENT, 0, 0);
+    int best = 0; double bd = 1e18;
+    for (size_t i = 0; i < g.rates.size(); i++) {
+        char b[48]; if (g.rates[i] >= 1e6) snprintf(b, sizeof b, "%.3f Msps", g.rates[i] / 1e6); else snprintf(b, sizeof b, "%.0f ksps", g.rates[i] / 1e3);
+        SendMessageA(g.cRate, CB_ADDSTRING, 0, (LPARAM)b);
+        double d = fabs(g.rates[i] - g.fs); if (d < bd) { bd = d; best = (int)i; }
+    }
+    SendMessage(g.cRate, CB_SETCURSEL, best, 0); g.fs = g.rates[best];
+}
+static void adaptUiToDevice() {
+    Device* d = g.dev; if (!d) return;
+    g.minF = d->minHz(); g.maxF = d->maxHz(); fillRates();
+    int n = d->gainSteps();
+    SendMessage(g.cGain, TBM_SETRANGE, TRUE, MAKELONG(0, std::max(0, n - 1)));
+    if (g.gainIdx >= n) g.gainIdx = std::max(0, n * 2 / 3);
+    SendMessage(g.cGain, TBM_SETPOS, TRUE, g.gainIdx); EnableWindow(g.cGain, n > 0);
+    EnableWindow(g.cTagc, d->hasAgc());
+    const char* en = d->extraName(); SetWindowTextA(g.cRagc, en ? en : "(n/a)"); EnableWindow(g.cRagc, en != nullptr);
+    EnableWindow(g.cBias, d->hasBias()); EnableWindow(g.cPpm, d->hasPpm()); EnableWindow(g.cHf, d->hasHf());
+    d->setHf(g.hfMode);
+    if (g.wantFreq < g.minF || g.wantFreq > g.maxF) setStatus("That frequency is outside this receiver's range; it will be restored if you switch back");
+    else if (!g.running) setStatus("Press Start to begin receiving");
+    g.hwValid = false; applyRx(); setFreq(g.wantFreq, false); updateLabels(); InvalidateRect(g.hwnd, 0, FALSE);
+}
+static void selectDevice() {
     if (g.running) return;
-    int sel = ComboBox_GetCurSel(g.cDev); int ndev = (int)rtlsdr_get_device_count();
-    g.demo = (sel >= ndev);
+    int sel = ComboBox_GetCurSel(g.cDev);
+    DevEntry e = { KIND_DEMO, 0, "Demo", "", 0 };
+    if (sel >= 0 && sel < (int)g.entries.size()) e = g.entries[sel];
+    if (g.dev) { delete g.dev; g.dev = nullptr; }
+    g.dev = makeDevice(e);
+    char b[300]; if (sel >= 0) { GetWindowTextA(g.cDev, b, sizeof b); g.lastDev = b; }
+    adaptUiToDevice();
+}
+static void refreshDeviceList() {
+    char cur[300] = ""; GetWindowTextA(g.cDev, cur, sizeof cur); if (!cur[0]) strncpy(cur, g.lastDev.c_str(), sizeof cur - 1);
+    enumerateDevices(g.entries);
+    SendMessage(g.cDev, CB_RESETCONTENT, 0, 0); int sel = -1;
+    for (size_t i = 0; i < g.entries.size(); i++) { SendMessageA(g.cDev, CB_ADDSTRING, 0, (LPARAM)g.entries[i].label.c_str()); if (g.entries[i].label == cur) sel = (int)i; }
+    int demoIdx = (int)SendMessageA(g.cDev, CB_ADDSTRING, 0, (LPARAM)"Demo (no hardware)");
+    if (sel < 0) sel = (std::string(cur) == "Demo (no hardware)" || g.entries.empty()) ? demoIdx : 0;
+    SendMessage(g.cDev, CB_SETCURSEL, sel, 0);
+}
+
+static void startRadio() {
+    if (g.running || !g.dev) return;
+    std::string err;
     g.stop = 0; g.hwValid = false;
-    if (!g.demo) {
-        if (rtlsdr_open(&g.dev, sel) < 0) {
-            g.dev = nullptr;
-            setStatus("Could not open the RTL-SDR. Is another program using it? Bind the WinUSB driver with Zadig (Bulk-In Interface 0).");
-            return;
-        }
-        g.tunerType = rtlsdr_get_tuner_type(g.dev); g.maxCenter = hwMaxFor(g.tunerType);
-        int n = rtlsdr_get_tuner_gains(g.dev, NULL); g.gains.clear();
-        if (n > 0) { g.gains.resize(n); rtlsdr_get_tuner_gains(g.dev, g.gains.data()); }
-        SendMessage(g.cGain, TBM_SETRANGE, TRUE, MAKELONG(0, std::max(0, (int)g.gains.size() - 1)));
-        if (g.gainIdx >= (int)g.gains.size()) g.gainIdx = std::max(0, (int)g.gains.size() * 2 / 3);
-        SendMessage(g.cGain, TBM_SETPOS, TRUE, g.gainIdx);
-        rtlsdr_set_direct_sampling(g.dev, g.hfMode);
-        rtlsdr_set_freq_correction(g.dev, g.ppm);
-        rtlsdr_set_sample_rate(g.dev, (uint32_t)g.fs);
-        rtlsdr_set_tuner_bandwidth(g.dev, 0);
-        rtlsdr_set_bias_tee(g.dev, g.bias ? 1 : 0);
-        applyGain();
-        const char* tn[] = { "unknown", "E4000", "FC0012", "FC0013", "FC2580", "R820T/R820T2", "R828D" };
-        char man[256] = "", prod[256] = "", ser[256] = ""; rtlsdr_get_usb_strings(g.dev, man, prod, ser);
-        char b[300]; snprintf(b, sizeof b, "%s (%s)", prod, tn[g.tunerType < 7 ? g.tunerType : 0]); g.devName = b;
-    } else { g.maxCenter = 2200e6; g.gains.clear(); g.devName = "Demo signal generator (no hardware)"; SendMessage(g.cGain, TBM_SETRANGE, TRUE, MAKELONG(0, 0)); }
-    EnableWindow(g.cBias, !g.demo);
+    if (!g.dev->open(err)) { setStatus(err); return; }
+    adaptUiToDevice();                                   // opened devices know their real sample-rate list
+    if (!g.dev->setRate(g.fs)) setStatus("Warning: that sample rate was rejected by the device");
+    g.dev->setPpm(g.ppm); g.dev->setHf(g.hfMode); applyGain();
+    g.dev->setBias(g.bias);
     applyRx(); retuneHardware(); applyRx(); ensureView();
-    if (!g.demo) { rtlsdr_reset_buffer(g.dev); g.devThread = CreateThread(0, 0, DevThread, 0, 0, 0); }
-    else g.devThread = CreateThread(0, 0, DemoThread, 0, 0, 0);
+    if (!g.dev->start(sampleSink)) { setStatus("Could not start streaming from the device"); g.dev->close(); return; }
     if (!g.audio.ok && !g.audio.open()) setStatus("No audio output device available");
-    g.running = true; SetWindowTextA(g.cStart, "Stop");
-    updateLabels(); setStatus(g.demo ? "Demo mode: simulated signals at 1, 7.03, 7.15, 10, 14.25, 27.185, 98.1, 121.5, 146.52 and 162.55 MHz" : "Receiving");
+    g.devName = g.dev->desc(); g.running = true; SetWindowTextA(g.cStart, "Stop"); EnableWindow(g.cDev, FALSE);
+    updateLabels();
+    setStatus(g.dev->kind() == KIND_DEMO ? "Demo mode: simulated signals at 1, 7.03, 7.15, 10, 14.25, 27.185, 98.1, 121.5, 146.52 and 162.55 MHz" : "Receiving");
     InvalidateRect(g.hwnd, 0, FALSE);
 }
 static void stopRecordings();
 static void stopRadio() {
     if (!g.running) return;
     g.stop = 1;
-    if (g.dev && !g.demo) rtlsdr_cancel_async(g.dev);
-    if (g.devThread) { WaitForSingleObject(g.devThread, 3000); CloseHandle(g.devThread); g.devThread = 0; }
-    if (g.dev) { rtlsdr_close(g.dev); g.dev = nullptr; }
+    if (g.dev) { g.dev->stop(); g.dev->close(); }
     stopRecordings();
-    g.running = false; SetWindowTextA(g.cStart, "Start"); setStatus("Stopped");
+    g.running = false; SetWindowTextA(g.cStart, "Start"); EnableWindow(g.cDev, TRUE); setStatus("Stopped");
 }
 static void stopRecordings() {
     if (g.recA) { wavHeader(g.recA, g.recAFrames); fclose(g.recA); g.recA = nullptr; SetWindowTextA(g.cRecA, "Rec Audio"); }
@@ -443,7 +380,7 @@ static bool parseFreq(const char* s, double& out) {
     char u = (char)tolower(*end);
     if (u == 'k') v *= 1e3; else if (u == 'm') v *= 1e6; else if (u == 'g') v *= 1e9;
     else if (v < 2500) v *= 1e6; else if (v < 2.5e6) v *= 1e3;
-    out = v; return v >= 1000 && v <= 2200e6;
+    out = v; return v >= 1000 && v <= 7000e6;
 }
 
 // ------------------------------------------------------------------ drawing
@@ -624,7 +561,7 @@ static void loadPresets() {
         parts.push_back(t.substr(a));
         if (parts.size() < 3) continue;
         UPreset p; p.name = parts[0]; p.f = atof(parts[1].c_str()); p.mode = atoi(parts[2].c_str()); p.bw = parts.size() > 3 ? atof(parts[3].c_str()) : 0;
-        if (p.name.empty() || p.f < 1000 || p.f > 2200e6 || p.mode < 0 || p.mode >= M_COUNT) continue;
+        if (p.name.empty() || p.f < 1000 || p.f > 7000e6 || p.mode < 0 || p.mode >= M_COUNT) continue;
         presets.push_back(p);
     }
     fclose(f);
@@ -723,6 +660,7 @@ static void saveSettings() {
 #define W(k, v) { snprintf(b, sizeof b, "%.0f", (double)(v)); WritePrivateProfileStringA("rx", k, b, p.c_str()); }
     W("freq", g.freq) W("mode", g.mode) W("rate", g.fs) W("step", g.stepIdx) W("zoom", g.zoomIdx) W("gain", g.gainIdx) W("tagc", g.tunerAgc)
     W("ragc", g.rtlAgc) W("bias", g.bias) W("nb", g.nb) W("deemph", g.deemph) W("stereo", g.stereo) W("agc", g.agcMode) W("ppm", g.ppm)
+    WritePrivateProfileStringA("rx", "device", g.lastDev.c_str(), p.c_str());
     W("hf", g.hfMode) W("vol", g.volume) W("sq", g.squelch) W("pitch", g.pitch) W("ref", g.refDb) W("rng", g.rngDb)
     for (int m = 0; m < M_COUNT; m++) { char k[16]; snprintf(k, sizeof k, "bw%d", m); W(k, g.bw[m]) }
 #undef W
@@ -737,8 +675,9 @@ static void loadSettings() {
     g.hfMode = std::max(0, std::min(2, I("hf", 0))); g.volume = I("vol", 50); g.squelch = I("sq", 0); g.pitch = I("pitch", 700);
     g.refDb = I("ref", -10); g.rngDb = I("rng", 90);
     for (int m = 0; m < M_COUNT; m++) { char k[16]; snprintf(k, sizeof k, "bw%d", m); g.bw[m] = I(k, (int)MODES[m].bwDef); g.bw[m] = std::max(MODES[m].bwMin, std::min(MODES[m].bwMax, g.bw[m])); }
-    bool ok = false; for (int i = 0; i < NRATES; i++) if (RATES[i] == g.fs) ok = true; if (!ok) g.fs = 2048000;
-    g.freq = std::max(1000.0, std::min(g.freq, 2200e6));
+    if (g.fs < 100e3 || g.fs > 25e6) g.fs = 2048000;
+    g.freq = std::max(1000.0, std::min(g.freq, 7000e6)); g.wantFreq = g.freq;
+    { char b[300]; GetPrivateProfileStringA("rx", "device", "", b, sizeof b, p.c_str()); g.lastDev = b; }
 }
 
 // ------------------------------------------------------------------ UI construction
@@ -784,9 +723,7 @@ static void createControls() {
     lbl("Device", 8, y3, 40); g.cDev = combo(IDC_DEV, 50, y3, 230, {}, 0);
     g.cStart = mk("BUTTON", "Start", BS_PUSHBUTTON | WS_TABSTOP, IDC_START, 288, y3, 64, 24);
     lbl("Sample rate", 362, y3, 66);
-    { char b[32]; HWND c = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_RATE, 430, y3, 92, 260); int sel = 5;
-      for (int i = 0; i < NRATES; i++) { snprintf(b, sizeof b, "%.3f Msps", RATES[i] / 1e6); SendMessageA(c, CB_ADDSTRING, 0, (LPARAM)b); if (RATES[i] == g.fs) sel = i; }
-      SendMessage(c, CB_SETCURSEL, sel, 0); g.cRate = c; }
+    g.cRate = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_RATE, 430, y3, 92, 260);
     lbl("PPM", 532, y3, 28); g.cPpm = mk("EDIT", "", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, IDC_PPM, 562, y3, 44, 22);
     { char b[16]; snprintf(b, sizeof b, "%d", g.ppm); SetWindowTextA(g.cPpm, b); }
     lbl("HF input", 616, y3, 52); g.cHf = combo(IDC_HF, 670, y3, 112, { "Auto (V3/V4)", "Force I branch", "Force Q branch" }, g.hfMode);
@@ -804,9 +741,7 @@ static void createControls() {
     mk("BUTTON", "Delete", BS_PUSHBUTTON | WS_TABSTOP, IDC_PDEL, 782, y4, 60, 24);
     mk("BUTTON", "Reset list", BS_PUSHBUTTON | WS_TABSTOP, IDC_PRESET, 846, y4, 74, 24);
 
-    int nd = (int)rtlsdr_get_device_count();
-    for (int i = 0; i < nd; i++) { char b[300]; const char* nm = rtlsdr_get_device_name(i); snprintf(b, sizeof b, "#%d  %s", i, nm ? nm : "RTL-SDR"); SendMessageA(g.cDev, CB_ADDSTRING, 0, (LPARAM)b); }
-    SendMessageA(g.cDev, CB_ADDSTRING, 0, (LPARAM)"Demo (no hardware)"); SendMessage(g.cDev, CB_SETCURSEL, 0, 0);
+    refreshDeviceList();
     SendMessage(g.cBw, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
     setBwTrack();
     g.PH = S(196);
@@ -837,15 +772,16 @@ static void onCommand(int id, int code) {
     case IDC_BAND: if (code == CBN_SELCHANGE) doPreset(ComboBox_GetCurSel(g.cBand)); break;
     case IDC_TAGC: g.tunerAgc = Button_GetCheck(g.cTagc) == BST_CHECKED; applyGain(); break;
     case IDC_RAGC: g.rtlAgc = Button_GetCheck(g.cRagc) == BST_CHECKED; applyGain(); break;
-    case IDC_BIAS: g.bias = Button_GetCheck(g.cBias) == BST_CHECKED; if (g.dev && !g.demo) rtlsdr_set_bias_tee(g.dev, g.bias); break;
+    case IDC_BIAS: g.bias = Button_GetCheck(g.cBias) == BST_CHECKED; if (g.dev && g.running) g.dev->setBias(g.bias); break;
     case IDC_NB: g.nb = Button_GetCheck(g.cNb) == BST_CHECKED; applyRx(); break;
     case IDC_DEEMPH: g.deemph = Button_GetCheck(g.cDeemph) == BST_CHECKED; applyRx(); break;
     case IDC_STEREO: g.stereo = Button_GetCheck(g.cStereo) == BST_CHECKED; applyRx(); break;
     case IDC_AGC: if (code == CBN_SELCHANGE) { g.agcMode = ComboBox_GetCurSel(g.cAgc); applyRx(); } break;
-    case IDC_RATE: if (code == CBN_SELCHANGE) { g.fs = RATES[ComboBox_GetCurSel(g.cRate)]; applySampleRate(); } break;
-    case IDC_HF: if (code == CBN_SELCHANGE) { g.hfMode = ComboBox_GetCurSel(g.cHf); if (g.dev && !g.demo) { rtlsdr_set_direct_sampling(g.dev, g.hfMode); g.hwValid = false; setFreq(g.freq); } } break;
+    case IDC_RATE: if (code == CBN_SELCHANGE) { int i = ComboBox_GetCurSel(g.cRate); if (i >= 0 && i < (int)g.rates.size()) { g.fs = g.rates[i]; applySampleRate(); } } break;
+    case IDC_DEV: if (code == CBN_DROPDOWN && !g.running) refreshDeviceList(); else if (code == CBN_SELCHANGE) selectDevice(); break;
+    case IDC_HF: if (code == CBN_SELCHANGE) { g.hfMode = ComboBox_GetCurSel(g.cHf); if (g.dev) { g.dev->setHf(g.hfMode); if (g.running) { g.hwValid = false; setFreq(g.freq); } } } break;
     case IDC_ZOOM: if (code == CBN_SELCHANGE) { g.zoomIdx = ComboBox_GetCurSel(g.cZoom); g.viewCenter = g.freq; ensureView(); InvalidateRect(g.hwnd, 0, FALSE); } break;
-    case IDC_PPM: if (code == EN_CHANGE) { char b[32]; GetWindowTextA(g.cPpm, b, 32); g.ppm = atoi(b); if (g.dev && !g.demo) { rtlsdr_set_freq_correction(g.dev, g.ppm); g.hwErr = rtlsdr_get_tuner_freq_error(g.dev); applyRx(); } } break;
+    case IDC_PPM: if (code == EN_CHANGE) { char b[32]; GetWindowTextA(g.cPpm, b, 32); g.ppm = atoi(b); if (g.dev && g.running) { g.dev->setPpm(g.ppm); g.hwErr = g.dev->centerError(); applyRx(); } } break;
     case IDC_GOBTN: { char b[64]; GetWindowTextA(g.cGo, b, 64); double f; if (parseFreq(b, f)) { setFreq(f); SetFocus(g.hwnd); } else setStatus("Could not understand that frequency"); } break;
     case IDC_PADD: case IDC_PEDIT: case IDC_PDEL: case IDC_PRESET: presetCmd(id); break;
     case IDC_START: if (g.running) stopRadio(); else startRadio(); break;
@@ -858,8 +794,9 @@ static void onCommand(int id, int code) {
     case IDC_RECI:
         if (g.recI) { stopRecordings(); setStatus("IQ recording saved"); break; }
         if (!g.running) { setStatus("Start the receiver first"); break; }
-        { char ts[32], p[MAX_PATH]; timestamp(ts, sizeof ts); snprintf(p, sizeof p, "%s\\iq_%s_%.0fHz_%.0fsps.cu8", recDir().c_str(), ts, g.hwCenter, g.fs);
-          g.recI = fopen(p, "wb"); if (g.recI) { SetWindowTextA(g.cRecI, "Stop Rec"); setStatus(std::string("Recording raw IQ (unsigned 8-bit) to ") + p); } }
+        { char ts[32], p[MAX_PATH]; timestamp(ts, sizeof ts); const char* ext = g.dev->kind() == KIND_HACKRF ? "cs8" : (g.dev->kind() == KIND_AIRSPY || g.dev->kind() == KIND_AIRSPYHF) ? "cf32" : "cu8";
+          snprintf(p, sizeof p, "%s\\iq_%s_%.0fHz_%.0fsps.%s", recDir().c_str(), ts, g.hwCenter, g.fs, ext);
+          g.recI = fopen(p, "wb"); if (g.recI) { SetWindowTextA(g.cRecI, "Stop Rec"); setStatus(std::string("Recording raw IQ to ") + p); } }
         break;
     }
 }
@@ -877,6 +814,7 @@ static bool inRect(const RECT& r, int x, int y) { return x >= r.left && x < r.ri
 
 static void onTimer() {
     if (!g.running) return;
+    if (g.dev && !g.dev->alive()) { PostMessage(g.hwnd, WM_DEVEND, 0, 0); return; }
     EnterCriticalSection(&g.rxCs);
     g.rx.snapshot(g.snap.data(), SPEC_N);
     float m = g.rx.meterDb;
@@ -964,12 +902,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show) {
         CW_USEDEFAULT, CW_USEDEFAULT, S(1180), S(760), 0, 0, hi, 0);
     SendMessage(w, WM_SETICON, ICON_BIG, (LPARAM)LoadImage(hi, MAKEINTRESOURCE(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
     SendMessage(w, WM_SETICON, ICON_SMALL, (LPARAM)LoadImage(hi, MAKEINTRESOURCE(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
-    createControls(); updateLabels(); setMode(g.mode);
+    createControls(); selectDevice(); updateLabels(); setMode(g.mode);
     ComboBox_SetCurSel(g.cStep, g.stepIdx);
     layoutPlot();
     g.hwCenter = g.freq + g.fs / 4; g.viewCenter = g.freq; ensureView();
     if (!g.audio.open()) g.status = "No audio output device found";
-    else g.status = "Choose a device and press Start (or pick 'Demo' to try it without hardware)";
+    else g.status = "Pick a device and press Start (or choose 'Demo' to try it without hardware)";
     SetTimer(w, 1, 40, 0); ShowWindow(w, show); InvalidateRect(w, 0, FALSE); SetFocus(w);
     MSG m; while (GetMessage(&m, 0, 0, 0) > 0) {
         if (m.message == WM_KEYDOWN && GetFocus() == w) { WndProc(w, WM_KEYDOWN, m.wParam, m.lParam); continue; }
